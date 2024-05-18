@@ -1,36 +1,24 @@
-'''
-    DESIGN:
-    - Accept a connection from a client and initiate a thread to handle the client
-    - Assign a unique ID to each client
-    - Send the client its ID, the 5x5x board, and the list of ships (names, counts, and sizes) and inform the client
-    that ships can be placed horizontally or vertically
-    - Give 60 seconds for the client to place its ships, otherwise, disconnect the client
-    - If all the ships are placed, inform the client that the game is ready to start
-    - Notify the client if ship placement is invalid, do not reset the timer
-    - If at the end of the 60 seconds, the client has not placed all the ships, disconnect the client
-    - Store each client's board and ships, and turn information in a dictionary
-    - Validate the client's shots and update the client's board
-    - Notify if torpedo hits a target
-    - Notify if the torpedo misses a target
-    - Notify if a ship is sunk
-    - Notify if all ships are sunk
-    - Notify if their ship is sunk/hit
-    - Check winning conditions at each turn and notify the client if they have won or lost
-'''
-
 import socket
 import threading
+import time
+from constants import (
+    SHIP_PLACEMENT_START_COMMAND, ERROR_FLAG, INFO_FLAG, INVALID_REQUEST_FLAG,
+    CLIENT_SHIP_PLACEMENT_COMMAND, CLIENT_SHOT_COMMAND
+)
+from utils import parse_socket_message
 
-# Constants
+# Server connection constants
 PORT = 12345
 SERVER = "localhost"
 ADDR = (SERVER, PORT)
-TIMEOUT = 60
+SHIP_PLACEMENT_TIMEOUT = 60
 MAX_CLIENTS = 2
+
+# Clients state
 client_id_counter = 0
 clients = {}
 
-GAME_STATE = {}
+# Game constants
 SHIPS = {
     "Mothership": {
         "count": 1,
@@ -45,8 +33,10 @@ SHIPS = {
         "size": 2
     },
 }
+BOARD_SIZE = 5
 
-
+# Game state
+GAME_STATE = {}
 
 def init_server():
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -55,40 +45,164 @@ def init_server():
     return server
 
 def disconnection_cleanup(client_socket, client_id):
+    if client_id not in clients:
+        return
+
     global client_id_counter
     client_socket.close()
     client_id_counter -= 1
     del clients[client_id]
 
+def is_valid_placement(board, ship_size, x, y, orientation):
+    if orientation == 'H':
+        if y + ship_size > BOARD_SIZE:
+            return False
+        for i in range(ship_size):
+            if board[x][y + i] != '~':
+                return False
+    elif orientation == 'V':
+        if x + ship_size > BOARD_SIZE:
+            return False
+        for i in range(ship_size):
+            if board[x + i][y] != '~':
+                return False
+    return True
+
+def place_ship_on_board(board, ship_size, x, y, orientation):
+    if orientation == 'H':
+        for i in range(ship_size):
+            board[x][y + i] = 'S'
+    elif orientation == 'V':
+        for i in range(ship_size):
+            board[x + i][y] = 'S'
+
+def format_board(board):
+    return "\n".join([" ".join(row) for row in board])
+
+def format_ships(ships):
+    return "\n".join([f"{name}: {info['count']} ship(s) of size {info['size']}" for name, info in ships.items()])
+
+def all_ships_sunk(board):
+    for row in board:
+        if 'S' in row:
+            return False
+    return True
+
+def send_message(client_socket, message, type="INFO", command="DEFAULT"):
+    time.sleep(0.3)
+    full_message = f"{type}:{command}:{message}".encode()
+    client_socket.sendall(full_message)
+
+def receive_message(client_socket):
+    message = client_socket.recv(1024)
+    return message
+
+def check_ship_placement(timer, client_socket, client_id):
+    if client_id in GAME_STATE and GAME_STATE[client_id].get("ships_placed", False):
+        timer.cancel()
+    elif client_id in GAME_STATE:
+        send_message(client_socket, "Timeout! You failed to place your ships in time.", type=ERROR_FLAG)
+        disconnection_cleanup(client_socket, client_id)
+
+def handle_ship_placement(client_socket, client_id, msg):
+    ship_name, position, orientation = msg.split(":")
+    x, y = int(position[0]), int(position[1])
+    if ship_name not in SHIPS:
+        send_message(client_socket, f"{ship_name} does not exist as a ship. Ships are: {format_ships(SHIPS)}", type=INVALID_REQUEST_FLAG)
+        return
+    if GAME_STATE.get(client_id, {}).get("ships_placed", False):
+        send_message(client_socket, "Ships have already been placed.", type=INVALID_REQUEST_FLAG)
+        return
+    if not is_valid_placement(GAME_STATE[client_id]["board"], SHIPS[ship_name]["size"], x, y, orientation):
+        send_message(client_socket, f"{ship_name} cannot be placed at {position} facing {orientation}.", type=INVALID_REQUEST_FLAG)
+        return
+    place_ship_on_board(GAME_STATE[client_id]["board"], SHIPS[ship_name]["size"], x, y, orientation)
+    GAME_STATE[client_id]["ships"][ship_name] = {
+        "position": position,
+        "orientation": orientation
+    }
+    
+    if len(GAME_STATE[client_id]["ships"]) == len(SHIPS):
+        GAME_STATE[client_id]["ships_placed"] = True
+        send_message(client_socket, "All ships placed. Game is ready to start.", type=INFO_FLAG)
+        if all(GAME_STATE[cid]["ships_placed"] for cid in GAME_STATE):
+            for cid in GAME_STATE:
+                send_message(clients[cid]["socket"], "All players have placed their ships. The game is starting!", type=INFO_FLAG)
+            # Notify the first client to start
+            send_message(clients[1]["socket"], "Your turn to shoot.", type=INFO_FLAG, command="YOUR_TURN")
+    else:
+        send_message(client_socket, f"Placed {ship_name} at {position} facing {orientation}. New board:\n{format_board(GAME_STATE[client_id]['board'])}")
+
+def handle_shot(client_socket, client_id, msg):
+    tx, ty = int(msg[0]), int(msg[1])
+    target_client_id = next(cid for cid in GAME_STATE if cid != client_id)
+    target_board = GAME_STATE[target_client_id]["board"]
+    if target_board[tx][ty] == 'S':
+        target_board[tx][ty] = 'X'  # Hit
+        GAME_STATE[target_client_id]["hits"].append((tx, ty))
+        send_message(client_socket, f"Hit at {msg}!", type=INFO_FLAG)
+        send_message(clients[target_client_id]["socket"], f"Your ship was hit at {msg}!", type=INFO_FLAG)
+        if all_ships_sunk(target_board):
+            send_message(client_socket, "You sunk all ships. You win!", type=INFO_FLAG)
+            send_message(clients[target_client_id]["socket"], "All ships sunk. You lose!", type=INFO_FLAG)
+            disconnection_cleanup(clients[target_client_id]["socket"], target_client_id)
+    else:
+        target_board[tx][ty] = 'O'  # Miss
+        GAME_STATE[target_client_id]["misses"].append((tx, ty))
+        send_message(client_socket, f"Miss at {msg}.", type=INFO_FLAG)
+    
+    # Notify the next player to take their turn
+    next_player_id = next(cid for cid in GAME_STATE if cid != client_id)
+    send_message(clients[next_player_id]["socket"], "Your turn to shoot.", type=INFO_FLAG, command="YOUR_TURN")
 
 def handle_client_thread(client_socket, client_addr, client_id):
     global client_id_counter
 
-    def send_message(message):
-        client_socket.send(message.encode())
+    send_message(client_socket, f"Welcome to Battleship! You are client {client_id}.")
 
-    def receive_message():
-        return client_socket.recv(1024).decode()
+    # Wait until both clients are connected
+    while len(clients) < MAX_CLIENTS:
+        time.sleep(1)
 
-    send_message(f"Welcome to Battleship! You are client {client_id}.")
+    # Create the board
+    board = [['~' for _ in range(BOARD_SIZE)] for _ in range(BOARD_SIZE)]
+    formatted_board = format_board(board)
+    formatted_ships = format_ships(SHIPS)
 
-    try:
-        while True:
-            message = client_socket.recv(1024)
-            if not message:
-                break
-            print(f"Received from client {client_id}: {message.decode()}")
-            client_socket.send(f"Ack: {message.decode()}".encode())
-    except OSError:
-        print(f"Client {client_id} has disconnected.")
-    finally:
-        disconnection_cleanup(client_socket, client_id)
+    # Send client ID, board, and ships information
+    send_message(client_socket, f"Your ID: {client_id}\nBoard:\n{formatted_board}\nYour Ships:\n{formatted_ships}\nShips can be placed horizontally or vertically.")
+    GAME_STATE[client_id] = {
+        "board": board,
+        "ships": {},
+        "ships_placed": False,
+        "hits": [],
+        "misses": [],
+    }
 
+    send_message(client_socket, "You have 60 seconds to place your ships.", command=SHIP_PLACEMENT_START_COMMAND)
+    timer = threading.Timer(SHIP_PLACEMENT_TIMEOUT, check_ship_placement, [timer, client_socket, client_id])
+    timer.start()
+
+    while True:
+        message = receive_message(client_socket)
+        if not message:
+            break
+        msg_type, msg_cmd, msg = parse_socket_message(message)
+        try:
+            if msg_cmd == CLIENT_SHIP_PLACEMENT_COMMAND:
+                handle_ship_placement(client_socket, client_id, msg)
+            elif msg_cmd == CLIENT_SHOT_COMMAND:
+                handle_shot(client_socket, client_id, msg)
+            else:
+                send_message(client_socket, "Command format is incorrect. Correct format is: <ship_name>:<x><y>:<orientation> or <x><y>", type=INVALID_REQUEST_FLAG)
+        except (ValueError, IndexError):
+            send_message(client_socket, "Command is incorrect. Correct format is: <ship_name>:<x><y>:<orientation> or <x><y>", type=INVALID_REQUEST_FLAG)
+            break
+    disconnection_cleanup(client_socket, client_id)
 
 def start_client_thread(client_socket, client_addr, client_id):
     client_thread = threading.Thread(target=handle_client_thread, args=(client_socket, client_addr, client_id))
     client_thread.start()
-
 
 def accept_clients(server):
     global client_id_counter
@@ -113,13 +227,11 @@ def accept_clients(server):
 
     print("All clients have connected.")
 
-
 def main():
     server = init_server()
     server.listen()
     print(f"Server is listening on {ADDR}")
 
     accept_clients(server)
-
 
 main()

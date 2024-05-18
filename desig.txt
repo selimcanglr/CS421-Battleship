@@ -1,0 +1,21 @@
+'''
+    DESIGN:
+    - Accept a connection from a client and initiate a thread to handle the client
+    - Assign a unique ID to each client
+    - Send the client its ID, the 5x5x board, and the list of ships (names, counts, and sizes) and inform the client
+    that ships can be placed horizontally or vertically
+    - Give 60 seconds for the client to place its ships, otherwise, disconnect the client
+      - A1-E5
+    - Notify the client if ship placement is invalid, do not reset the timer
+    - If at the end of the 60 seconds, the client has not placed all the ships, disconnect the client
+    - Store each client's board and ships, and turn information in a dictionary
+    
+    - If all the ships are placed, inform the client that the game is ready to start
+    - Validate the client's shots and update the client's board
+    - Notify if torpedo hits a target
+    - Notify if the torpedo misses a target
+    - Notify if a ship is sunk
+    - Notify if all ships are sunk
+    - Notify if their ship is sunk/hit
+    - Check winning conditions at each turn and notify the client if they have won or lost
+'''
