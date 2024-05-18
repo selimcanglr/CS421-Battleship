@@ -34,8 +34,7 @@ def listen_to_server(client_socket):
                 break
             if rcv_msg is None:
                 print("Server disconnected.")
-                sys.exit(0)
-
+                
             flag, command, server_msg = parse_socket_message(rcv_msg)
             if server_msg:
                 print(f"Server: {server_msg}")

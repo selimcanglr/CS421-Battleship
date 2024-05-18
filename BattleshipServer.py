@@ -100,9 +100,18 @@ def all_ships_sunk(board):
             return False
     return True
 
+def format_hits_misses(hits, misses):
+    hits_str = "Hits:\n" + "\n".join([f"({x},{y})" for x, y in hits])
+    misses_str = "Misses:\n" + "\n".join([f"({x},{y})" for x, y in misses])
+    return hits_str + "\n" + misses_str
+
 def send_board_and_turn_info():
     for cid in clients:
-        send_message(clients[cid]["socket"], f"Your board:\n{format_board(GAME_STATE[cid]['board'])}", type=INFO_FLAG)
+        opponent_id = next(id for id in GAME_STATE if id != cid)
+        board_str = format_board(GAME_STATE[cid]['board'])
+        hits_misses_str = format_hits_misses(GAME_STATE[opponent_id]['hits'], GAME_STATE[opponent_id]['misses'])
+        send_message(clients[cid]["socket"], f"Your board:\n{board_str}\n{hits_misses_str}", type=INFO_FLAG)
+    
     current_turn = 1
     send_message(clients[current_turn]["socket"], "Your turn!", type=INFO_FLAG, command="YOUR_TURN")
     other_turn = next(cid for cid in GAME_STATE if cid != current_turn)
@@ -110,11 +119,6 @@ def send_board_and_turn_info():
 
 def handle_ship_placement(client_socket, client_id, msg):
     try:
-        print("Message:", msg)
-        if msg == SEE_BOARD_COMMAND:
-            send_message(client_socket, f"Your current board:\n{format_board(GAME_STATE[client_id]['board'])}", type=INFO_FLAG)
-            return
-
         ship_name, position, orientation = msg.split(":")
         x, y = int(position[0]), int(position[1])
         print(f"Client {client_id} is placing {ship_name} at {position} facing {orientation}.")
@@ -148,10 +152,6 @@ def handle_ship_placement(client_socket, client_id, msg):
         send_message(client_socket, "Command is incorrect. Correct format is: <ship_name>:<x><y>:<orientation>", type=INVALID_REQUEST_FLAG)
 
 def handle_shot(client_socket, client_id, msg):
-    if msg == SEE_BOARD_COMMAND:
-        send_message(client_socket, f"Your current board:\n{format_board(GAME_STATE[client_id]['board'])}", type=INFO_FLAG)
-        return
-    
     tx, ty = int(msg[0]), int(msg[1])
     target_client_id = next(cid for cid in GAME_STATE if cid != client_id)
     target_board = GAME_STATE[target_client_id]["board"]
@@ -177,11 +177,13 @@ def handle_client_thread(client_socket, client_addr, client_id):
 
     def check_ship_placement():
         if client_id in GAME_STATE and GAME_STATE[client_id].get("ships_placed", False):
-            send_message(client_socket, "Timeout! You failed to place your ships in time.", type=ERROR_FLAG, command=DISCONNECT_COMMAND)
+            timer.cancel()
+        elif client_id in GAME_STATE:
+            send_message(client_socket, "Timeout! You failed to place your ships in time.", type=ERROR_FLAG)
             disconnection_cleanup(client_socket, client_id)
-            
 
     try:
+        send_message(client_socket, f"Welcome to Battleship! You are client {client_id}. Press 'quit' to disconnect. Type 'SEE_BOARD' to see the board and your ships.")
 
         # Create the board
         board = [['~' for _ in range(BOARD_SIZE)] for _ in range(BOARD_SIZE)]
@@ -189,7 +191,7 @@ def handle_client_thread(client_socket, client_addr, client_id):
         formatted_ships = format_ships(SHIPS)
 
         # Send client ID, board, and ships information
-        send_message(client_socket, f"Your ID: {client_id}\nBoard:\n{formatted_board}\nYour Ships:\n{formatted_ships}\nShips can be placed horizontally or vertically.\nYou can type 'SEE_BOARD' to see your current board.")
+        send_message(client_socket, f"Your ID: {client_id}\nBoard:\n{formatted_board}\nYour Ships:\n{formatted_ships}\nShips can be placed horizontally or vertically.")
         GAME_STATE[client_id] = {
             "board": board,
             "ships": {},
@@ -211,9 +213,7 @@ def handle_client_thread(client_socket, client_addr, client_id):
                     return
                 msg_type, msg_cmd, msg = parse_socket_message(message)
                 try:
-                    if msg_cmd == SEE_BOARD_COMMAND:
-                        send_message(client_socket, f"Your current board:\n{format_board(GAME_STATE[client_id]['board'])}", type=INFO_FLAG)  
-                    elif msg_cmd == CLIENT_SHIP_PLACEMENT_COMMAND:
+                    if msg_cmd == CLIENT_SHIP_PLACEMENT_COMMAND:
                         handle_ship_placement(client_socket, client_id, msg)
                     elif msg_cmd == CLIENT_SHOT_COMMAND:
                         handle_shot(client_socket, client_id, msg)
