@@ -1,8 +1,8 @@
 import socket
 from constants import (
-    SHIP_PLACEMENT_START_COMMAND, INVALID_REQUEST_FLAG, CLIENT_SHIP_PLACEMENT_COMMAND, CLIENT_SHOT_COMMAND, TURN_COMMAND
+    SHIP_PLACEMENT_START_COMMAND, INVALID_REQUEST_FLAG, CLIENT_SHIP_PLACEMENT_COMMAND, CLIENT_SHOT_COMMAND, TURN_COMMAND, SHIP_PLACEMENT_END_COMMAND
 )
-from utils import parse_socket_message, send_message
+from utils import parse_socket_message, send_message, receive_message
 
 # Constants
 PORT = 12345
@@ -23,13 +23,12 @@ def connect_to_server():
 def listen_to_server(client_socket):
     while True:
         try:
-            rcv_msg = client_socket.recv(1024)
+            rcv_msg = receive_message(client_socket)
             if not rcv_msg:
                 break
             flag, command, server_msg = parse_socket_message(rcv_msg)
-            if not server_msg:
-                continue
-            print(f"Server: {server_msg}")
+            if server_msg:
+                print(f"Server: {server_msg}")
             if command == SHIP_PLACEMENT_START_COMMAND:
                 start_ships_placement(client_socket)
             elif command == TURN_COMMAND:
@@ -37,40 +36,40 @@ def listen_to_server(client_socket):
         except OSError:
             break
 
-def wait_for_server_response(client_socket):
+def wait_for_socket_response(client_socket):
     while True:
         try:
-            rcv_msg = client_socket.recv(1024)
+            rcv_msg = receive_message(client_socket)
             if not rcv_msg:
                 break
             flag, command, server_msg = parse_socket_message(rcv_msg)
             return flag, command, server_msg
         except OSError as e:
             print(f"Error: {e}")
+            
 
 def start_ships_placement(client_socket):
     while True:
         placement = input("Enter ship placement (format: <ship_name>:<x><y>:<orientation>): ")
         try:
-            send_message(placement, client_socket, command=CLIENT_SHIP_PLACEMENT_COMMAND)
-            msg_type, command, message = wait_for_server_response(client_socket)
-            if msg_type == INVALID_REQUEST_FLAG:
-                print(message)
-                continue
-            print(message)  # Print server response for valid placement
-            break  # Break the loop if the placement is valid
+            send_message(client_socket, placement, command=CLIENT_SHIP_PLACEMENT_COMMAND)
+            msg_type, command, message = wait_for_socket_response(client_socket)
+            print(message)
+            
+            if command == SHIP_PLACEMENT_END_COMMAND:
+                break
         except ValueError as e:
             print(f"Invalid placement (format: <ship_name>:<x><y>:<orientation>). Please try again.")
         except ConnectionAbortedError:
             print("Server aborted connection.")
             break
-
+    
 def handle_shooting(client_socket):
     while True:
         shot = input("Enter shot coordinates (format: <x><y>): ")
         try:
-            send_message(shot, client_socket, command=CLIENT_SHOT_COMMAND)
-            msg_type, command, message = wait_for_server_response(client_socket)
+            send_message(client_socket, shot, command=CLIENT_SHOT_COMMAND)
+            msg_type, command, message = wait_for_socket_response(client_socket)
             print(message)
             if command != "YOUR_TURN":
                 break  # If it's not your turn anymore, break the loop
