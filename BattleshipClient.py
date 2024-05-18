@@ -6,6 +6,7 @@ from constants import (
 )
 from utils import parse_socket_message, send_message, receive_message
 import sys
+import queue
 
 # Constants
 PORT = 12345
@@ -13,6 +14,9 @@ SERVER_IP = "localhost"
 
 # Flag to indicate if the client should keep running
 running = True
+
+# Queue for communicating between threads
+message_queue = queue.Queue()
 
 def connect_to_server():
     client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -34,8 +38,12 @@ def listen_to_server(client_socket):
                 break
             if rcv_msg is None:
                 print("Server disconnected.")
+                running = False
+                sys.exit(0)
                 
             flag, command, server_msg = parse_socket_message(rcv_msg)
+            message_queue.put((flag, command, server_msg))
+
             if server_msg:
                 print(f"Server: {server_msg}")
             if command == DISCONNECT_COMMAND:
@@ -44,9 +52,9 @@ def listen_to_server(client_socket):
                 print("Disconnected from server.")
                 sys.exit(0)
             elif command == SHIP_PLACEMENT_START_COMMAND:
-                threading.Thread(target=start_ships_placement, args=(client_socket,)).start()
+                start_ships_placement(client_socket)
             elif command == TURN_COMMAND:
-                threading.Thread(target=handle_shooting, args=(client_socket,)).start()
+                handle_shooting(client_socket)
         except OSError:
             break
 
@@ -63,22 +71,43 @@ def wait_for_socket_response(client_socket):
 
 def start_ships_placement(client_socket):
     while True:
-        placement = input("Enter ship placement (format: <ship_name>:<x><y>:<orientation>): ")
+        if not message_queue.empty():
+            flag, command, server_msg = message_queue.get()
+            if command == DISCONNECT_COMMAND:
+                print("Server disconnected.")
+                return
+            if command == SHIP_PLACEMENT_END_COMMAND:
+                break
+
+        placement = input("Enter ship placement (format: <ship_name>:<x><y>:<orientation>, e.g. Mothership:01:H or Mothership:01:V): ")
+        if placement == "QUIT":
+            send_message(client_socket, "", command=QUIT_COMMAND)
+            break
+        elif placement == "SEE_BOARD":
+            send_message(client_socket, "", command=SEE_BOARD_COMMAND)
+            msg_type, command, message = wait_for_socket_response(client_socket)
+            print(message)
+            continue
         try:
             send_message(client_socket, placement, command=CLIENT_SHIP_PLACEMENT_COMMAND)
             msg_type, command, message = wait_for_socket_response(client_socket)
             print(message)
-            
             if command == SHIP_PLACEMENT_END_COMMAND:
                 break
         except ValueError as e:
-            print(f"Invalid placement (format: <ship_name>:<x><y>:<orientation>). Please try again.")
+            print(f"Invalid placement (format: <ship_name>:<x><y>:<orientation>, e.g. Mothership:01:H or Mothership:01:V). Please try again.")
         except ConnectionAbortedError:
             print("Server aborted connection.")
             break
 
 def handle_shooting(client_socket):
     while True:
+        if not message_queue.empty():
+            flag, command, server_msg = message_queue.get()
+            if command == DISCONNECT_COMMAND:
+                print("Server disconnected.")
+                return
+
         shot = input("Enter shot coordinates (format: <x><y>): ")
         try:
             send_message(client_socket, shot, command=CLIENT_SHOT_COMMAND)
@@ -90,11 +119,12 @@ def handle_shooting(client_socket):
             print("Server aborted connection.")
             break
 
-
 def main():
     client_socket = connect_to_server()
     if client_socket:
-        listen_to_server(client_socket)
+        listener_thread = threading.Thread(target=listen_to_server, args=(client_socket,))
+        listener_thread.start()
+        listener_thread.join()
 
 if __name__ == "__main__":
     main()

@@ -4,7 +4,7 @@ import select
 from constants import (
     SHIP_PLACEMENT_START_COMMAND, ERROR_FLAG, INFO_FLAG, INVALID_REQUEST_FLAG,
     CLIENT_SHIP_PLACEMENT_COMMAND, CLIENT_SHOT_COMMAND, SHIP_PLACEMENT_END_COMMAND,
-    DISCONNECT_COMMAND, SEE_BOARD_COMMAND
+    DISCONNECT_COMMAND, SEE_BOARD_COMMAND, TURN_COMMAND
 )
 from utils import parse_socket_message, send_message, receive_message
 
@@ -43,13 +43,13 @@ def init_server():
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.bind(ADDR)
     server.listen()
-    server.setblocking(0)  # Non-blocking
+    server.setblocking(0)
     return server
 
 def disconnection_cleanup(client_socket, client_id):
     global client_id_counter
 
-    if client_id not in clients:
+    if client_id not in clients or clients[client_id]["socket"] != client_socket:
         return
     try:
         send_message(client_socket, "You have been disconnected from the server.", type=ERROR_FLAG, command=DISCONNECT_COMMAND)
@@ -101,19 +101,30 @@ def all_ships_sunk(board):
     return True
 
 def format_hits_misses(hits, misses):
-    hits_str = "Hits:\n" + "\n".join([f"({x},{y})" for x, y in hits])
-    misses_str = "Misses:\n" + "\n".join([f"({x},{y})" for x, y in misses])
-    return hits_str + "\n" + misses_str
+    # Initialize the board with empty spaces
+    board = [['~' for _ in range(BOARD_SIZE)] for _ in range(BOARD_SIZE)]
+    
+    # Mark the hits with 'X'
+    for x, y in hits:
+        board[x][y] = 'X'
+    
+    # Mark the misses with 'O'
+    for x, y in misses:
+        board[x][y] = 'O'
+    
+    # Convert the board to a string format
+    board_str = "\n".join([" ".join(row) for row in board])
+    return board_str
 
 def send_board_and_turn_info():
     for cid in clients:
         opponent_id = next(id for id in GAME_STATE if id != cid)
         board_str = format_board(GAME_STATE[cid]['board'])
         hits_misses_str = format_hits_misses(GAME_STATE[opponent_id]['hits'], GAME_STATE[opponent_id]['misses'])
-        send_message(clients[cid]["socket"], f"Your board:\n{board_str}\n{hits_misses_str}", type=INFO_FLAG)
+        send_message(clients[cid]["socket"], f"Your board:\n{board_str}\nHits and misses:\n{hits_misses_str}", type=INFO_FLAG)
     
-    current_turn = 1
-    send_message(clients[current_turn]["socket"], "Your turn!", type=INFO_FLAG, command="YOUR_TURN")
+    current_turn = GAME_STATE["current_turn"]
+    send_message(clients[current_turn]["socket"], "Your turn!", type=INFO_FLAG, command=TURN_COMMAND)
     other_turn = next(cid for cid in GAME_STATE if cid != current_turn)
     send_message(clients[other_turn]["socket"], "Wait for the other player.", type=INFO_FLAG)
 
@@ -138,12 +149,14 @@ def handle_ship_placement(client_socket, client_id, msg):
 
         place_ship_on_board(GAME_STATE[client_id]["board"], SHIPS[ship_name]["size"], x, y, orientation)
         GAME_STATE[client_id]["ships"][ship_name] = GAME_STATE[client_id]["ships"].get(ship_name, 0) + 1
+        print(f"Placing {ship_name} at {position} facing {orientation}.")
         if len(GAME_STATE[client_id]["ships"]) == len(SHIPS):
             GAME_STATE[client_id]["ships_placed"] = True
             send_message(client_socket, f"Board placement complete, wait further instructions. Your board:\n{format_board(GAME_STATE[client_id]['board'])}.", type=INFO_FLAG, command=SHIP_PLACEMENT_END_COMMAND)
             if all(GAME_STATE[cid]["ships_placed"] for cid in GAME_STATE):
                 for cid in GAME_STATE:
                     send_message(clients[cid]["socket"], "All players have placed their ships. The game is starting!", type=INFO_FLAG)
+                GAME_STATE["current_turn"] = next(iter(GAME_STATE))  # Initialize the first turn
                 send_board_and_turn_info()
         else:
             send_message(client_socket, f"Placed {ship_name} at {position} facing {orientation}. New board:\n{format_board(GAME_STATE[client_id]['board'])}\nRemaining ships:\n{remaining_ships(client_id)}")
@@ -161,13 +174,18 @@ def handle_shot(client_socket, client_id, msg):
         send_message(client_socket, f"Hit at {msg}!", type=INFO_FLAG)
         send_message(clients[target_client_id]["socket"], f"Your ship was hit at {msg}!", type=INFO_FLAG)
         if all_ships_sunk(target_board):
-            send_message(client_socket, "You sunk all ships. You win!", type=INFO_FLAG)
-            send_message(clients[target_client_id]["socket"], "All ships sunk. You lose!", type=INFO_FLAG)
+            send_message(client_socket, "You sunk all ships. You WIN!", type=INFO_FLAG)
+            send_message(clients[target_client_id]["socket"], "All ships sunk. You LOSE!", type=INFO_FLAG)
             disconnection_cleanup(clients[target_client_id]["socket"], target_client_id)
+    elif target_board[tx][ty] == 'X':
+        send_message(client_socket, f"Already hit at {msg}.", type=INFO_FLAG)
     else:
         target_board[tx][ty] = 'O'  # Miss
         GAME_STATE[target_client_id]["misses"].append((tx, ty))
         send_message(client_socket, f"Miss at {msg}.", type=INFO_FLAG)
+
+    # Update the turn
+    GAME_STATE["current_turn"] = target_client_id if GAME_STATE["current_turn"] == client_id else client_id
 
     # Notify both clients of their board state and the turn information
     send_board_and_turn_info()
@@ -176,14 +194,13 @@ def handle_client_thread(client_socket, client_addr, client_id):
     global client_id_counter
 
     def check_ship_placement():
-        if client_id in GAME_STATE and GAME_STATE[client_id].get("ships_placed", False):
-            timer.cancel()
-        elif client_id in GAME_STATE:
-            send_message(client_socket, "Timeout! You failed to place your ships in time.", type=ERROR_FLAG)
-            disconnection_cleanup(client_socket, client_id)
+        for client_id, client_info in list(clients.items()):
+            if client_id in GAME_STATE and not GAME_STATE[client_id].get("ships_placed", False):
+                send_message(client_info["socket"], "Timeout! You failed to place your ships in time.", type=ERROR_FLAG, command=DISCONNECT_COMMAND)
+                disconnection_cleanup(client_info["socket"], client_id)
 
     try:
-        send_message(client_socket, f"Welcome to Battleship! You are client {client_id}. Press 'quit' to disconnect. Type 'SEE_BOARD' to see the board and your ships.")
+        send_message(client_socket, f"You can type 'SEE_BOARD' to see the board and your ships.")
 
         # Create the board
         board = [['~' for _ in range(BOARD_SIZE)] for _ in range(BOARD_SIZE)]
@@ -230,7 +247,6 @@ def handle_client_thread(client_socket, client_addr, client_id):
                     return
     except OSError:
         print(f"Client {client_id} disconnected.")
-        disconnection_cleanup(client_socket, client_id)
     finally:
         disconnection_cleanup(client_socket, client_id)
 
