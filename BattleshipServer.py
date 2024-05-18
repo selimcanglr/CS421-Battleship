@@ -3,7 +3,8 @@ import threading
 import select
 from constants import (
     SHIP_PLACEMENT_START_COMMAND, ERROR_FLAG, INFO_FLAG, INVALID_REQUEST_FLAG,
-    CLIENT_SHIP_PLACEMENT_COMMAND, CLIENT_SHOT_COMMAND, SHIP_PLACEMENT_END_COMMAND
+    CLIENT_SHIP_PLACEMENT_COMMAND, CLIENT_SHOT_COMMAND, SHIP_PLACEMENT_END_COMMAND,
+    DISCONNECT_COMMAND, SEE_BOARD_COMMAND
 )
 from utils import parse_socket_message, send_message, receive_message
 
@@ -46,10 +47,15 @@ def init_server():
     return server
 
 def disconnection_cleanup(client_socket, client_id):
+    global client_id_counter
+
     if client_id not in clients:
         return
-
-    global client_id_counter
+    try:
+        send_message(client_socket, "You have been disconnected from the server.", type=ERROR_FLAG, command=DISCONNECT_COMMAND)
+    except OSError:
+        pass
+    
     client_socket.close()
     client_id_counter -= 1
     del clients[client_id]
@@ -104,8 +110,14 @@ def send_board_and_turn_info():
 
 def handle_ship_placement(client_socket, client_id, msg):
     try:
+        print("Message:", msg)
+        if msg == SEE_BOARD_COMMAND:
+            send_message(client_socket, f"Your current board:\n{format_board(GAME_STATE[client_id]['board'])}", type=INFO_FLAG)
+            return
+
         ship_name, position, orientation = msg.split(":")
         x, y = int(position[0]), int(position[1])
+        print(f"Client {client_id} is placing {ship_name} at {position} facing {orientation}.")
         if ship_name not in SHIPS:
             send_message(client_socket, f"{ship_name} does not exist as a ship. Ships are: {format_ships(SHIPS)}", type=INVALID_REQUEST_FLAG)
             return
@@ -119,11 +131,9 @@ def handle_ship_placement(client_socket, client_id, msg):
         if not valid:
             send_message(client_socket, f"{ship_name} cannot be placed at {position} facing {orientation}. Reason: {reason}", type=INVALID_REQUEST_FLAG)
             return
+
         place_ship_on_board(GAME_STATE[client_id]["board"], SHIPS[ship_name]["size"], x, y, orientation)
         GAME_STATE[client_id]["ships"][ship_name] = GAME_STATE[client_id]["ships"].get(ship_name, 0) + 1
-
-        send_message(client_socket, f"Placed {ship_name} at {position} facing {orientation}. New board:\n{format_board(GAME_STATE[client_id]['board'])}\nRemaining ships:\n{remaining_ships(client_id)}")
-
         if len(GAME_STATE[client_id]["ships"]) == len(SHIPS):
             GAME_STATE[client_id]["ships_placed"] = True
             send_message(client_socket, f"Board placement complete, wait further instructions. Your board:\n{format_board(GAME_STATE[client_id]['board'])}.", type=INFO_FLAG, command=SHIP_PLACEMENT_END_COMMAND)
@@ -131,11 +141,17 @@ def handle_ship_placement(client_socket, client_id, msg):
                 for cid in GAME_STATE:
                     send_message(clients[cid]["socket"], "All players have placed their ships. The game is starting!", type=INFO_FLAG)
                 send_board_and_turn_info()
+        else:
+            send_message(client_socket, f"Placed {ship_name} at {position} facing {orientation}. New board:\n{format_board(GAME_STATE[client_id]['board'])}\nRemaining ships:\n{remaining_ships(client_id)}")
+            
     except (ValueError, IndexError):
         send_message(client_socket, "Command is incorrect. Correct format is: <ship_name>:<x><y>:<orientation>", type=INVALID_REQUEST_FLAG)
 
-
 def handle_shot(client_socket, client_id, msg):
+    if msg == SEE_BOARD_COMMAND:
+        send_message(client_socket, f"Your current board:\n{format_board(GAME_STATE[client_id]['board'])}", type=INFO_FLAG)
+        return
+    
     tx, ty = int(msg[0]), int(msg[1])
     target_client_id = next(cid for cid in GAME_STATE if cid != client_id)
     target_board = GAME_STATE[target_client_id]["board"]
@@ -161,13 +177,11 @@ def handle_client_thread(client_socket, client_addr, client_id):
 
     def check_ship_placement():
         if client_id in GAME_STATE and GAME_STATE[client_id].get("ships_placed", False):
-            timer.cancel()
-        elif client_id in GAME_STATE:
-            send_message(client_socket, "Timeout! You failed to place your ships in time.", type=ERROR_FLAG)
+            send_message(client_socket, "Timeout! You failed to place your ships in time.", type=ERROR_FLAG, command=DISCONNECT_COMMAND)
             disconnection_cleanup(client_socket, client_id)
+            
 
     try:
-        send_message(client_socket, f"Welcome to Battleship! You are client {client_id}.")
 
         # Create the board
         board = [['~' for _ in range(BOARD_SIZE)] for _ in range(BOARD_SIZE)]
@@ -175,7 +189,7 @@ def handle_client_thread(client_socket, client_addr, client_id):
         formatted_ships = format_ships(SHIPS)
 
         # Send client ID, board, and ships information
-        send_message(client_socket, f"Your ID: {client_id}\nBoard:\n{formatted_board}\nYour Ships:\n{formatted_ships}\nShips can be placed horizontally or vertically.")
+        send_message(client_socket, f"Your ID: {client_id}\nBoard:\n{formatted_board}\nYour Ships:\n{formatted_ships}\nShips can be placed horizontally or vertically.\nYou can type 'SEE_BOARD' to see your current board.")
         GAME_STATE[client_id] = {
             "board": board,
             "ships": {},
@@ -197,10 +211,18 @@ def handle_client_thread(client_socket, client_addr, client_id):
                     return
                 msg_type, msg_cmd, msg = parse_socket_message(message)
                 try:
-                    if msg_cmd == CLIENT_SHIP_PLACEMENT_COMMAND:
+                    if msg_cmd == SEE_BOARD_COMMAND:
+                        send_message(client_socket, f"Your current board:\n{format_board(GAME_STATE[client_id]['board'])}", type=INFO_FLAG)  
+                    elif msg_cmd == CLIENT_SHIP_PLACEMENT_COMMAND:
                         handle_ship_placement(client_socket, client_id, msg)
                     elif msg_cmd == CLIENT_SHOT_COMMAND:
                         handle_shot(client_socket, client_id, msg)
+                    elif msg_cmd == DISCONNECT_COMMAND:
+                        print(f"Client {client_id} requested to disconnect.")
+                        disconnection_cleanup(client_socket, client_id)
+                        return
+                    elif msg_cmd == SEE_BOARD_COMMAND:
+                        send_message(client_socket, f"Your current board:\n{format_board(GAME_STATE[client_id]['board'])}", type=INFO_FLAG)
                     else:
                         send_message(client_socket, "Command format is incorrect. Correct format is: <ship_name>:<x><y>:<orientation> or <x><y>", type=INVALID_REQUEST_FLAG)
                 except (ValueError, IndexError):
